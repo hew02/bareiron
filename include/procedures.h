@@ -4,8 +4,11 @@
 #include <unistd.h>
 
 #include "globals.h"
+#include "worldgen.h"
+#include "registries.h"
 
 extern int client_states[MAX_PLAYERS * 2];
+
 
 void setClientState (int client_fd, int new_state);
 int getClientState (int client_fd);
