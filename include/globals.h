@@ -102,6 +102,9 @@
 // clients from Keep Alive packets.
 #define NETWORK_TIMEOUT_TIME 15000000
 
+// Size of the receive buffer for incoming string data
+#define MAX_RECV_BUF_LEN 256
+
 // If defined, sends the server brand to clients. Doesn't do much, but will
 // show up in the top-left of the F3/debug menu, in the Minecraft client.
 // You can change the brand string in the "brand" variable in src/globals.c
@@ -241,12 +244,25 @@ typedef struct {
   uint8_t y;
   short z;
   // Lower 5 bits: health
-  // Middle 1 bit: reserved for future use
+  // Middle 1 bit: sheep sheared, unused for other mobs
   // Upper 2 bits: panic timer
   uint8_t data;
 } MobData;
 
 #pragma pack(pop)
+
+union EntityDataValue {
+  uint8_t byte;
+  int pose;
+};
+
+typedef struct {
+  uint8_t index;
+  // 0 - Byte
+  // 21 - Pose
+  int type;
+  union EntityDataValue value;
+} EntityData;
 
 extern BlockChange block_changes[MAX_BLOCK_CHANGES];
 extern int block_changes_count;

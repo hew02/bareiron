@@ -125,6 +125,22 @@ int getPlayerData (int client_fd, PlayerData **output) {
   return 1;
 }
 
+// Returns the player with the given name, or NULL if not found
+PlayerData *getPlayerByName (int start_offset, int end_offset, uint8_t *buffer) {
+  for (int i = 0; i < MAX_PLAYERS; i ++) {
+    if (player_data[i].client_fd == -1) continue;
+    int j;
+    for (j = start_offset; j < end_offset && j < 256 && buffer[j] != ' '; j++) {
+      if (player_data[i].name[j - start_offset] != buffer[j]) break;
+    }
+    if ((j == end_offset || buffer[j] == ' ') && j < 256) {
+      return &player_data[i];
+    }
+  }
+  return NULL;
+}
+
+
 // Marks a client as disconnected and cleans up player data
 void handlePlayerDisconnect (int client_fd) {
   // Search for a corresponding player in the player data array
@@ -368,6 +384,87 @@ void spawnPlayer (PlayerData *player) {
 
 }
 
+// Broadcasts a player's entity metadata (sneak/sprint state) to other players
+void broadcastPlayerMetadata (PlayerData *player) {
+  uint8_t sneaking = (player->flags & 0x04) != 0;
+  uint8_t sprinting = (player->flags & 0x08) != 0;
+
+  uint8_t entity_bit_mask = 0;
+  if (sneaking) entity_bit_mask |= 0x02;
+  if (sprinting) entity_bit_mask |= 0x08;
+
+  int pose = 0;
+  if (sneaking) pose = 5;
+
+  EntityData metadata[] = {
+    {
+      0,               // Index (Entity Bit Mask)
+      0,               // Type (Byte)
+      entity_bit_mask, // Value
+    },
+    {
+      6,    // Index (Pose),
+      21,   // Type (Pose),
+      pose, // Value (Standing)
+    }
+  };
+
+  for (int i = 0; i < MAX_PLAYERS; i ++) {
+    PlayerData* other_player = &player_data[i];
+    int client_fd = other_player->client_fd;
+
+    if (client_fd == -1) continue;
+    if (client_fd == player->client_fd) continue;
+    if (other_player->flags & 0x20) continue;
+
+    sc_setEntityMetadata(client_fd, player->client_fd, metadata, 2);
+  }
+}
+
+// Sends a mob's entity metadata to the given player.
+// If client_fd is -1, broadcasts to all player
+void broadcastMobMetadata (int client_fd, int entity_id) {
+
+  MobData *mob = &mob_data[-entity_id - 2];
+
+  EntityData *metadata;
+  size_t length;
+
+  switch (mob->type) {
+    case 106: // Sheep
+      if (!((mob->data >> 5) & 1)) // Don't send metadata if sheep isn't sheared
+        return;
+
+      metadata = malloc(sizeof *metadata);
+      metadata[0] = (EntityData){
+        17,            // Index (Sheep Bit Mask),
+        0,             // Type (Byte),
+        (uint8_t)0x10, // Value
+      };
+      length = 1;
+
+      break;
+
+    default: return;
+  }
+
+  if (client_fd == -1) {
+    for (int i = 0; i < MAX_PLAYERS; i ++) {
+      PlayerData* player = &player_data[i];
+      client_fd = player->client_fd;
+
+      if (client_fd == -1) continue;
+      if (player->flags & 0x20) continue;
+
+      sc_setEntityMetadata(client_fd, entity_id, metadata, length);
+    }
+  } else {
+    sc_setEntityMetadata(client_fd, entity_id, metadata, length);
+  }
+
+  free(metadata);
+}
+
 uint8_t getBlockChange (short x, uint8_t y, short z) {
   for (int i = 0; i < block_changes_count; i ++) {
     if (block_changes[i].block == 0xFF) continue;
@@ -482,6 +579,8 @@ uint8_t makeBlockChange (short x, uint8_t y, short z, uint8_t block) {
     // which naturally appends the chest to the end if a gap isn't found.
     int last_real_entry = first_gap - 1;
     for (int i = first_gap; i <= block_changes_count + 15; i ++) {
+      if (i >= MAX_BLOCK_CHANGES) break; // No more space, trigger failBlockChange
+
       if (block_changes[i].block != 0xFF) {
         last_real_entry = i;
         continue;
@@ -1307,9 +1406,55 @@ void spawnMob (uint8_t type, short x, uint8_t y, short z, uint8_t health) {
       );
     }
 
+    // Freshly spawned mobs currently don't need metadata updates.
+    // If this changes, uncomment this line.
+    // broadcastMobMetadata(-1, i);
+
     break;
   }
 
+}
+
+void interactEntity (int entity_id, int interactor_id) {
+
+  PlayerData *player;
+  if (getPlayerData(interactor_id, &player)) return;
+
+  MobData *mob = &mob_data[-entity_id - 2];
+
+  switch (mob->type) {
+    case 106: // Sheep
+      if (player->inventory_items[player->hotbar] != I_shears)
+        return;
+
+      if ((mob->data >> 5) & 1) // Check if sheep has already been sheared
+        return;
+
+      mob->data |= 1 << 5; // Set sheared to true
+
+      bumpToolDurability(player);
+
+      #ifdef ENABLE_PICKUP_ANIMATION
+      playPickupAnimation(player, I_white_wool, mob->x, mob->y, mob->z);
+      #endif
+
+      uint8_t item_count = 1 + (fast_rand() & 1); // 1-2
+      givePlayerItem(player, I_white_wool, item_count);
+
+      for (int i = 0; i < MAX_PLAYERS; i ++) {
+        PlayerData* player = &player_data[i];
+        int client_fd = player->client_fd;
+
+        if (client_fd == -1) continue;
+        if (player->flags & 0x20) continue;
+
+        sc_entityAnimation(client_fd, interactor_id, 0);
+      }
+
+      broadcastMobMetadata(-1, entity_id);
+
+      break;
+  }
 }
 
 void hurtEntity (int entity_id, int attacker_id, uint8_t damage_type, uint8_t damage) {
@@ -1508,6 +1653,7 @@ void handleServerTick (int64_t time_since_last_tick) {
     }
     #ifdef ENABLE_CACTUS_DAMAGE
     // Tick damage from a cactus block if one is under/inside or around the player.
+<<<<<<< HEAD
     if (block == B_cactus 
       || getBlockAt(player->x + 1, player->y, player->z) == B_cactus
       || getBlockAt(player->x - 1, player->y, player->z) == B_cactus
@@ -1515,6 +1661,14 @@ void handleServerTick (int64_t time_since_last_tick) {
       || getBlockAt(player->x, player->y, player->z - 1) == B_cactus) {
       hurtEntity(player->client_fd, -1, D_cactus, 4);
     }
+=======
+    if (block == B_cactus ||
+      getBlockAt(player->x + 1, player->y, player->z) == B_cactus ||
+      getBlockAt(player->x - 1, player->y, player->z) == B_cactus ||
+      getBlockAt(player->x, player->y, player->z + 1) == B_cactus ||
+      getBlockAt(player->x, player->y, player->z - 1) == B_cactus
+    ) hurtEntity(player->client_fd, -1, D_cactus, 4);
+>>>>>>> 182a180c2e150665e19fcc92f123ce5ed17c2409
     #endif
     // Heal from saturation if player is able and has enough food
     if (player->health >= 20 || player->health == 0) continue;
@@ -1671,39 +1825,38 @@ void handleServerTick (int64_t time_since_last_tick) {
     // Holds the block above the target block, i.e. the "head" block
     uint8_t block_above = getBlockAt(new_x, new_y + 1, new_z);
 
-    if ( // Validate movement on X axis
-      new_x != old_x &&
+    // Validate movement on X axis
+    if (new_x != old_x && (
       !isPassableBlock(getBlockAt(new_x, new_y + 1, old_z)) ||
       (
         !isPassableBlock(getBlockAt(new_x, new_y, old_z)) &&
         !isPassableBlock(getBlockAt(new_x, new_y + 2, old_z))
       )
-    ) {
+    )) {
       new_x = old_x;
       block = getBlockAt(old_x, new_y, new_z);
       block_above = getBlockAt(old_x, new_y + 1, new_z);
     }
-    if ( // Validate movement on Z axis
-      new_z != old_z &&
+    // Validate movement on Z axis
+    if (new_z != old_z && (
       !isPassableBlock(getBlockAt(old_x, new_y + 1, new_z)) ||
       (
         !isPassableBlock(getBlockAt(old_x, new_y, new_z)) &&
         !isPassableBlock(getBlockAt(old_x, new_y + 2, new_z))
       )
-    ) {
+    )) {
       new_z = old_z;
       block = getBlockAt(new_x, new_y, old_z);
       block_above = getBlockAt(new_x, new_y + 1, old_z);
     }
-
-    if ( // Validate diagonal movement
-      new_x != old_x && new_z != old_z &&
+    // Validate diagonal movement
+    if (new_x != old_x && new_z != old_z && (
       !isPassableBlock(block_above) ||
       (
         !isPassableBlock(block) &&
         !isPassableBlock(getBlockAt(new_x, new_y + 2, new_z))
       )
-    ) {
+    )) {
       // We know that movement along just one axis is fine thanks to the
       // checks above, pick one based on proximity.
       int dist_x = abs(old_x - closest_player->x);
@@ -1785,3 +1938,47 @@ void broadcastChestUpdate (int origin_fd, uint8_t *storage_ptr, uint16_t item, u
 
 }
 #endif
+
+ssize_t writeEntityData (int client_fd, EntityData *data) {
+  writeByte(client_fd, data->index);
+  writeVarInt(client_fd, data->type);
+
+  switch (data->type) {
+    case 0: // Byte
+      return writeByte(client_fd, data->value.byte);
+    case 21: // Pose
+      writeVarInt(client_fd, data->value.pose);
+      return 0;
+
+    default: return -1;
+  }
+}
+
+// Returns the networked size of an EntityData entry
+int sizeEntityData (EntityData *data) {
+  int value_size;
+
+  switch (data->type) {
+    case 0: // Byte
+      value_size = 1;
+      break;
+    case 21: // Pose
+      value_size = sizeVarInt(data->value.pose);
+      break;
+
+    default: return -1;
+  }
+
+  return 1 + sizeVarInt(data->type) + value_size;
+}
+
+// Returns the networked size of an array of EntityData entries
+int sizeEntityMetadata (EntityData *metadata, size_t length) {
+  int total_size = 0;
+  for (size_t i = 0; i < length; i ++) {
+    int size = sizeEntityData(&metadata[i]);
+    if (size == -1) return -1;
+    total_size += size;
+  }
+  return total_size;
+}
